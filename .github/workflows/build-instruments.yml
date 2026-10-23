@@ -1,4 +1,3 @@
-
 name: Build Upstox Instruments
 
 on:
@@ -30,17 +29,20 @@ jobs:
               URL,
               headers={"User-Agent": "Mozilla/5.0"}
           )
+
           with urllib.request.urlopen(req, timeout=120) as response:
               raw = response.read()
 
           try:
               raw = gzip.decompress(raw)
-          except gzip.BadGzipFile:
+          except (gzip.BadGzipFile, OSError):
               pass
 
           data = json.loads(raw.decode("utf-8-sig"))
+
           if isinstance(data, dict):
               data = data.get("data", [])
+
           if not isinstance(data, list) or not data:
               raise RuntimeError("Instrument master is empty or has an unexpected format")
 
@@ -51,19 +53,31 @@ jobs:
                       return value
               return ""
 
+          def upper(row, *keys):
+              return str(val(row, *keys)).strip().upper()
+
           def expiry_key(row):
               value = val(row, "expiry")
+
+              if not value:
+                  return "9999-12-31"
+
               try:
                   number = int(value)
                   if number > 10**12:
                       number //= 1000
-                  return datetime.fromtimestamp(number, timezone.utc).date().isoformat()
+                  if number > 10**9:
+                      return datetime.fromtimestamp(
+                          number, timezone.utc
+                      ).date().isoformat()
               except (ValueError, TypeError, OSError):
-                  return str(value)[:10] if value else "9999-12-31"
+                  pass
+
+              return str(value)[:10]
 
           def normalized(row):
               return {
-                  "symbol": str(val(row, "underlying_symbol", "trading_symbol")),
+                  "symbol": str(val(row, "trading_symbol", "underlying_symbol")),
                   "name": str(val(row, "name", "trading_symbol")),
                   "exchange": str(val(row, "exchange")),
                   "instrument_key": str(val(row, "instrument_key")),
@@ -75,31 +89,40 @@ jobs:
                   "underlying": str(val(row, "underlying_symbol")),
               }
 
-          # Find actual NSE equity records for stocks that have NSE stock futures.
+          # Identify NSE stocks that have stock-futures contracts.
+          stock_future_types = {"FUTSTK", "FUT"}
+
           stock_futures = [
-           r for r in data
-          if val(r, "segment") == "NSE_FO"
-          and val(r, "instrument_type") == "FUT"
-          and val(r, "underlying_type") == "EQUITY"
-          and val(r, "underlying_symbol")
-          and val(r, "instrument_key")
-         ]
+              r for r in data
+              if upper(r, "segment") == "NSE_FO"
+              and upper(r, "instrument_type") in stock_future_types
+              and upper(r, "underlying_symbol")
+              and val(r, "instrument_key")
+          ]
 
           eligible_symbols = {
-              str(val(r, "underlying_symbol")).upper()
+              upper(r, "underlying_symbol")
               for r in stock_futures
           }
 
+          # Keep the corresponding NSE cash-equity instrument keys.
           equities = {}
+
           for r in data:
-              if val(r, "segment") == "NSE_EQ" and val(r, "instrument_type") == "EQ":
-                  symbol = str(val(r, "trading_symbol")).upper()
+              if (
+                  upper(r, "segment") == "NSE_EQ"
+                  and upper(r, "instrument_type") == "EQ"
+              ):
+                  symbol = upper(r, "trading_symbol")
+
                   if symbol in eligible_symbols and val(r, "instrument_key"):
                       equities[symbol] = r
 
           stocks = []
+
           for symbol in sorted(eligible_symbols):
               r = equities.get(symbol)
+
               if r:
                   item = normalized(r)
                   item["symbol"] = symbol
@@ -108,38 +131,51 @@ jobs:
                   item["underlying"] = symbol
                   stocks.append(item)
 
-          # Keep supported cash index instruments only, not index option contracts.
+          # Keep supported cash indices, excluding index-option contracts.
           indices = []
+
           for r in data:
-              if (val(r, "segment") == "NSE_INDEX"
-                  and val(r, "instrument_type") == "INDEX"
-                  and val(r, "instrument_key")):
+              if (
+                  upper(r, "segment") == "NSE_INDEX"
+                  and upper(r, "instrument_type") == "INDEX"
+                  and val(r, "instrument_key")
+              ):
                   item = normalized(r)
                   item["category"] = "INDEX"
                   indices.append(item)
 
-          # Keep the nearest dated futures contract for each MCX underlying.
+          # Find the nearest unexpired MCX futures contract per underlying.
+          mcx_future_types = {"FUTCOM", "FUT"}
+
           mcx = [
-           r for r in data
-          if val(r, "segment") == "MCX_FO"
-          and val(r, "instrument_type") == "FUT"
-          and val(r, "underlying_type") == "COM"
-          and val(r, "instrument_key")
-          and expiry_key(r) >= datetime.now(timezone.utc).date().isoformat()
-         ]
+              r for r in data
+              if upper(r, "segment") == "MCX_FO"
+              and upper(r, "instrument_type") in mcx_future_types
+              and val(r, "instrument_key")
+              and expiry_key(r) >= datetime.now(timezone.utc).date().isoformat()
+          ]
 
           nearest = {}
+
           for r in mcx:
-              key = str(val(r, "underlying_symbol", "trading_symbol")).upper()
+              key = upper(r, "underlying_symbol", "trading_symbol")
+
               if not key:
                   continue
-              if key not in nearest or expiry_key(r) < expiry_key(nearest[key]):
+
+              if (
+                  key not in nearest
+                  or expiry_key(r) < expiry_key(nearest[key])
+              ):
                   nearest[key] = r
 
           commodities = []
-          for r in nearest.values():
-              item = normalized(r)
+
+          for key in sorted(nearest):
+              item = normalized(nearest[key])
+              item["symbol"] = key
               item["category"] = "MCX_FUTURE"
+              item["underlying"] = key
               commodities.append(item)
 
           output = {
@@ -153,16 +189,27 @@ jobs:
               "instruments": stocks + indices + commodities,
           }
 
+          # Print source diagnostics to help identify filter mismatches.
+          print("Raw records:", len(data))
+          print("Segments:", sorted({
+              upper(r, "segment") for r in data
+          }))
+          print("Instrument types:", sorted({
+              upper(r, "instrument_type") for r in data
+          }))
+          print("Output counts:", json.dumps(output["counts"]))
+
           if not output["instruments"]:
-              raise RuntimeError("No instruments matched. Check the source schema and filters.")
+              raise RuntimeError(
+                  "No instruments matched. Review the source schema and filters."
+              )
 
           with open("instruments.json", "w", encoding="utf-8") as f:
               json.dump(output, f, ensure_ascii=False, separators=(",", ":"))
 
-          print(json.dumps(output["counts"]))
           print("Total output records:", len(output["instruments"]))
           PY
-                  
+
           python build_instruments.py
           python -m json.tool instruments.json > /dev/null
 
