@@ -1,0 +1,173 @@
+
+name: Build Upstox Instruments
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 2 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build instrument list
+        run: |
+          cat > build_instruments.py <<'PY'
+          import gzip
+          import json
+          import urllib.request
+          from datetime import datetime, timezone
+
+          URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
+
+          req = urllib.request.Request(
+              URL,
+              headers={"User-Agent": "Mozilla/5.0"}
+          )
+          with urllib.request.urlopen(req, timeout=120) as response:
+              raw = response.read()
+
+          try:
+              raw = gzip.decompress(raw)
+          except gzip.BadGzipFile:
+              pass
+
+          data = json.loads(raw.decode("utf-8-sig"))
+          if isinstance(data, dict):
+              data = data.get("data", [])
+          if not isinstance(data, list) or not data:
+              raise RuntimeError("Instrument master is empty or has an unexpected format")
+
+          def val(row, *keys):
+              for key in keys:
+                  value = row.get(key)
+                  if value not in (None, ""):
+                      return value
+              return ""
+
+          def expiry_key(row):
+              value = val(row, "expiry")
+              try:
+                  number = int(value)
+                  if number > 10**12:
+                      number //= 1000
+                  return datetime.fromtimestamp(number, timezone.utc).date().isoformat()
+              except (ValueError, TypeError, OSError):
+                  return str(value)[:10] if value else "9999-12-31"
+
+          def normalized(row):
+              return {
+                  "symbol": str(val(row, "underlying_symbol", "trading_symbol")),
+                  "name": str(val(row, "name", "trading_symbol")),
+                  "exchange": str(val(row, "exchange")),
+                  "instrument_key": str(val(row, "instrument_key")),
+                  "segment": str(val(row, "segment")),
+                  "type": str(val(row, "instrument_type")),
+                  "lot_size": val(row, "lot_size"),
+                  "tick_size": val(row, "tick_size"),
+                  "expiry": str(val(row, "expiry")),
+                  "underlying": str(val(row, "underlying_symbol")),
+              }
+
+          # Find actual NSE equity records for stocks that have NSE stock futures.
+          stock_futures = [
+              r for r in data
+              if val(r, "segment") == "NSE_FO"
+              and val(r, "instrument_type") == "FUTSTK"
+              and val(r, "underlying_symbol")
+              and val(r, "instrument_key")
+          ]
+
+          eligible_symbols = {
+              str(val(r, "underlying_symbol")).upper()
+              for r in stock_futures
+          }
+
+          equities = {}
+          for r in data:
+              if val(r, "segment") == "NSE_EQ" and val(r, "instrument_type") == "EQ":
+                  symbol = str(val(r, "trading_symbol")).upper()
+                  if symbol in eligible_symbols and val(r, "instrument_key"):
+                      equities[symbol] = r
+
+          stocks = []
+          for symbol in sorted(eligible_symbols):
+              r = equities.get(symbol)
+              if r:
+                  item = normalized(r)
+                  item["symbol"] = symbol
+                  item["name"] = str(val(r, "name", "trading_symbol"))
+                  item["category"] = "NSE_FO_STOCK"
+                  item["underlying"] = symbol
+                  stocks.append(item)
+
+          # Keep supported cash index instruments only, not index option contracts.
+          indices = []
+          for r in data:
+              if (val(r, "segment") == "NSE_INDEX"
+                  and val(r, "instrument_type") == "INDEX"
+                  and val(r, "instrument_key")):
+                  item = normalized(r)
+                  item["category"] = "INDEX"
+                  indices.append(item)
+
+          # Keep the nearest dated futures contract for each MCX underlying.
+          mcx = [
+              r for r in data
+              if val(r, "segment") == "MCX_FO"
+              and val(r, "instrument_type") == "FUTCOM"
+              and val(r, "instrument_key")
+              and expiry_key(r) >= datetime.now(timezone.utc).date().isoformat()
+          ]
+
+          nearest = {}
+          for r in mcx:
+              key = str(val(r, "underlying_symbol", "trading_symbol")).upper()
+              if not key:
+                  continue
+              if key not in nearest or expiry_key(r) < expiry_key(nearest[key]):
+                  nearest[key] = r
+
+          commodities = []
+          for r in nearest.values():
+              item = normalized(r)
+              item["category"] = "MCX_FUTURE"
+              commodities.append(item)
+
+          output = {
+              "source": URL,
+              "generated_at": datetime.now(timezone.utc).isoformat(),
+              "counts": {
+                  "nse_fo_stocks": len(stocks),
+                  "indices": len(indices),
+                  "mcx_futures": len(commodities),
+              },
+              "instruments": stocks + indices + commodities,
+          }
+
+          if not output["instruments"]:
+              raise RuntimeError("No instruments matched. Check the source schema and filters.")
+
+          with open("instruments.json", "w", encoding="utf-8") as f:
+              json.dump(output, f, ensure_ascii=False, separators=(",", ":"))
+
+          print(json.dumps(output["counts"]))
+          print("Total output records:", len(output["instruments"]))
+          PY
+
+          python build_instruments.py
+          python -m json.tool instruments.json > /dev/null
+
+      - name: Commit generated JSON
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add instruments.json
+          git diff --cached --quiet || git commit -m "Update Upstox instruments"
+          git push
