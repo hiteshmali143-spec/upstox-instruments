@@ -77,12 +77,13 @@ jobs:
 
           # Find actual NSE equity records for stocks that have NSE stock futures.
           stock_futures = [
-              r for r in data
-              if val(r, "segment") == "NSE_FO"
-              and val(r, "instrument_type") == "FUTSTK"
-              and val(r, "underlying_symbol")
-              and val(r, "instrument_key")
-          ]
+    r for r in data
+    if val(r, "segment") == "NSE_FO"
+    and val(r, "instrument_type") == "FUT"
+    and val(r, "underlying_type") == "EQUITY"
+    and val(r, "underlying_symbol")
+    and val(r, "instrument_key")
+]
 
           eligible_symbols = {
               str(val(r, "underlying_symbol")).upper()
@@ -119,12 +120,13 @@ jobs:
 
           # Keep the nearest dated futures contract for each MCX underlying.
           mcx = [
-              r for r in data
-              if val(r, "segment") == "MCX_FO"
-              and val(r, "instrument_type") == "FUTCOM"
-              and val(r, "instrument_key")
-              and expiry_key(r) >= datetime.now(timezone.utc).date().isoformat()
-          ]
+    r for r in data
+    if val(r, "segment") == "MCX_FO"
+    and val(r, "instrument_type") == "FUT"
+    and val(r, "underlying_type") == "COM"
+    and val(r, "instrument_key")
+    and expiry_key(r) >= datetime.now(timezone.utc).date().isoformat()
+]
 
           nearest = {}
           for r in mcx:
