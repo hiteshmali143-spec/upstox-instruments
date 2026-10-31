@@ -1,0 +1,29 @@
+name: F&O Background Scanner
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: fno-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run scanner batches
+        env:
+          SCAN_URL: https://v4fpkn0clrz0y5ks177lwhqb.dev.scramapps.com/api/dataSource/oAG_0094O/scan-market
+          SCAN_TOKEN: ${{ secrets.SCANNER_API_TOKEN }}
+        run: |
+          set -e
+          for i in 1 2 3 4 5 6; do
+            echo "===== Batch $i ====="
+            curl --silent --show-error --fail-with-body \
+              -X POST "$SCAN_URL" \
+              -H "Authorization: Bearer $SCAN_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"source\":\"github-actions-batch-$i\"}" \
+              -w "\nHTTP %{http_code}\n"
+            sleep 5
+          done
