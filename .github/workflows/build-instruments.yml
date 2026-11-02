@@ -47,9 +47,7 @@ jobs:
               data = data.get("data", [])
 
           if not isinstance(data, list) or not data:
-              raise RuntimeError(
-                  "Instrument master is empty or has an unexpected format"
-              )
+              raise RuntimeError("Instrument master is empty")
 
           def val(row, *keys):
               for key in keys:
@@ -67,10 +65,8 @@ jobs:
               if not value:
                   return "9999-12-31"
 
-              text_value = str(value).strip()
-
               try:
-                  number = int(float(text_value))
+                  number = int(float(value))
 
                   if number > 10**12:
                       number //= 1000
@@ -81,6 +77,8 @@ jobs:
                       ).date().isoformat()
               except (ValueError, TypeError, OSError, OverflowError):
                   pass
+
+              text_value = str(value).strip()
 
               try:
                   return datetime.fromisoformat(
@@ -105,17 +103,19 @@ jobs:
                   "underlying": str(val(row, "underlying_symbol")),
               }
 
-          # 1. NSE stock futures only. Exclude index futures.
+          # 1. NSE stock futures.
+          # Upstox uses FUT + underlying_type EQUITY.
           stock_futures = [
               r for r in data
               if upper(r, "segment") == "NSE_FO"
-              and upper(r, "instrument_type") == "FUTSTK"
+              and upper(r, "instrument_type") == "FUT"
+              and upper(r, "underlying_type") == "EQUITY"
               and upper(r, "underlying_symbol")
               and val(r, "instrument_key")
               and expiry_key(r) >= TODAY
           ]
 
-          # 2. Select nearest unexpired contract per stock.
+          # 2. Nearest unexpired futures contract per stock.
           nearest_stock_future = {}
 
           for r in stock_futures:
@@ -129,10 +129,10 @@ jobs:
               ):
                   nearest_stock_future[symbol] = r
 
-          # 3. Find corresponding NSE cash-equity instruments.
-          equities = {}
-
           eligible_symbols = set(nearest_stock_future.keys())
+
+          # 3. Corresponding NSE cash-equity instruments.
+          equities = {}
 
           for r in data:
               if (
@@ -162,7 +162,7 @@ jobs:
               item["underlying"] = symbol
               stocks.append(item)
 
-          # 4. Save nearest stock futures separately for OI calculation.
+          # 4. Separate current-month stock futures mapping.
           stock_futures_current_month = []
 
           for symbol in sorted(nearest_stock_future):
@@ -170,14 +170,12 @@ jobs:
 
               item = normalized(r)
               item["symbol"] = symbol
-              item["name"] = str(
-                  val(r, "name", "trading_symbol", "underlying_symbol")
-              )
               item["category"] = "NSE_STOCK_FUTURE"
               item["underlying"] = symbol
+
               stock_futures_current_month.append(item)
 
-          # 5. Cash indices only. No index option contracts.
+          # 5. NSE cash indices only.
           indices = []
 
           for r in data:
@@ -190,11 +188,13 @@ jobs:
                   item["category"] = "INDEX"
                   indices.append(item)
 
-          # 6. Nearest unexpired MCX futures per underlying.
+          # 6. MCX futures.
+          # Upstox uses FUT + underlying_type COM.
           mcx = [
               r for r in data
               if upper(r, "segment") == "MCX_FO"
-              and upper(r, "instrument_type") == "FUTCOM"
+              and upper(r, "instrument_type") == "FUT"
+              and upper(r, "underlying_type") == "COM"
               and val(r, "instrument_key")
               and expiry_key(r) >= TODAY
           ]
@@ -222,7 +222,7 @@ jobs:
               item["underlying"] = key
               commodities.append(item)
 
-          # 7. Final output.
+          # 7. Final JSON.
           output = {
               "source": URL,
               "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -230,43 +230,55 @@ jobs:
                   "nse_fo_stocks": len(stocks),
                   "nse_stock_futures": len(stock_futures_current_month),
                   "indices": len(indices),
-                  "mcx_futures": len(commodities),
+                  "mcx_futures": len(commodities)
               },
-              "instruments": (
-                  stocks
-                  + indices
-                  + commodities
-              ),
-              "stock_futures_current_month": stock_futures_current_month,
+              "instruments": stocks + indices + commodities,
+              "stock_futures_current_month": stock_futures_current_month
           }
 
           # 8. Diagnostics.
           print("Raw records:", len(data))
+
+          print("Segments:", sorted({
+              upper(r, "segment") for r in data
+          }))
+
+          print("Instrument types:", sorted({
+              upper(r, "instrument_type") for r in data
+          }))
+
+          print("Underlying types:", sorted({
+              upper(r, "underlying_type") for r in data
+          }))
+
           print("NSE stock futures contracts found:", len(stock_futures))
-          print(
-              "Current month stock futures:",
-              len(stock_futures_current_month)
-          )
+          print("Current month stock futures:", len(stock_futures_current_month))
+          print("NSE cash stocks matched:", len(stocks))
+          print("MCX futures found:", len(mcx))
+
           print("Output counts:", json.dumps(output["counts"]))
 
-          print("Sample current month stock futures:")
+          print("Sample stock futures:")
 
           for item in stock_futures_current_month[:5]:
+              print(json.dumps(item, ensure_ascii=False))
+
+          print("Sample MCX futures:")
+
+          for item in commodities[:3]:
               print(json.dumps(item, ensure_ascii=False))
 
           if not stocks:
               raise RuntimeError("No NSE F&O equity instruments found")
 
           if not stock_futures_current_month:
-              raise RuntimeError(
-                  "No NSE stock futures found. Check Upstox master schema."
-              )
+              raise RuntimeError("No NSE stock futures found")
 
           if not indices:
-              raise RuntimeError("No NSE cash indices found")
+              raise RuntimeError("No NSE indices found")
 
           if not commodities:
-              raise RuntimeError("No unexpired MCX futures found")
+              raise RuntimeError("No MCX futures found")
 
           with open("instruments.json", "w", encoding="utf-8") as f:
               json.dump(
@@ -277,10 +289,6 @@ jobs:
               )
 
           print("Total main instruments:", len(output["instruments"]))
-          print(
-              "Total stock futures mapping:",
-              len(output["stock_futures_current_month"])
-          )
           print("UNIVERSE BUILD SUCCESS")
           PY
 
