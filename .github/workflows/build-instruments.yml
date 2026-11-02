@@ -1,3 +1,4 @@
+
 name: Build Upstox Instruments
 
 on:
@@ -22,8 +23,10 @@ jobs:
           import json
           import urllib.request
           from datetime import datetime, timezone
+          from zoneinfo import ZoneInfo
 
           URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
+          TODAY = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
 
           req = urllib.request.Request(
               URL,
@@ -44,7 +47,9 @@ jobs:
               data = data.get("data", [])
 
           if not isinstance(data, list) or not data:
-              raise RuntimeError("Instrument master is empty or has an unexpected format")
+              raise RuntimeError(
+                  "Instrument master is empty or has an unexpected format"
+              )
 
           def val(row, *keys):
               for key in keys:
@@ -62,22 +67,33 @@ jobs:
               if not value:
                   return "9999-12-31"
 
+              text_value = str(value).strip()
+
               try:
-                  number = int(value)
+                  number = int(float(text_value))
+
                   if number > 10**12:
                       number //= 1000
+
                   if number > 10**9:
                       return datetime.fromtimestamp(
                           number, timezone.utc
                       ).date().isoformat()
-              except (ValueError, TypeError, OSError):
+              except (ValueError, TypeError, OSError, OverflowError):
                   pass
 
-              return str(value)[:10]
+              try:
+                  return datetime.fromisoformat(
+                      text_value.replace("Z", "+00:00")
+                  ).date().isoformat()
+              except ValueError:
+                  return text_value[:10]
 
           def normalized(row):
               return {
-                  "symbol": str(val(row, "trading_symbol", "underlying_symbol")),
+                  "symbol": str(val(
+                      row, "trading_symbol", "underlying_symbol"
+                  )),
                   "name": str(val(row, "name", "trading_symbol")),
                   "exchange": str(val(row, "exchange")),
                   "instrument_key": str(val(row, "instrument_key")),
@@ -89,24 +105,34 @@ jobs:
                   "underlying": str(val(row, "underlying_symbol")),
               }
 
-          # Identify NSE stocks that have stock-futures contracts.
-          stock_future_types = {"FUTSTK", "FUT"}
-
+          # 1. NSE stock futures only. Exclude index futures.
           stock_futures = [
               r for r in data
               if upper(r, "segment") == "NSE_FO"
-              and upper(r, "instrument_type") in stock_future_types
+              and upper(r, "instrument_type") == "FUTSTK"
               and upper(r, "underlying_symbol")
               and val(r, "instrument_key")
+              and expiry_key(r) >= TODAY
           ]
 
-          eligible_symbols = {
-              upper(r, "underlying_symbol")
-              for r in stock_futures
-          }
+          # 2. Select nearest unexpired contract per stock.
+          nearest_stock_future = {}
 
-          # Keep the corresponding NSE cash-equity instrument keys.
+          for r in stock_futures:
+              symbol = upper(r, "underlying_symbol")
+
+              if (
+                  symbol not in nearest_stock_future
+                  or expiry_key(r) < expiry_key(
+                      nearest_stock_future[symbol]
+                  )
+              ):
+                  nearest_stock_future[symbol] = r
+
+          # 3. Find corresponding NSE cash-equity instruments.
           equities = {}
+
+          eligible_symbols = set(nearest_stock_future.keys())
 
           for r in data:
               if (
@@ -115,7 +141,10 @@ jobs:
               ):
                   symbol = upper(r, "trading_symbol")
 
-                  if symbol in eligible_symbols and val(r, "instrument_key"):
+                  if (
+                      symbol in eligible_symbols
+                      and val(r, "instrument_key")
+                  ):
                       equities[symbol] = r
 
           stocks = []
@@ -123,15 +152,32 @@ jobs:
           for symbol in sorted(eligible_symbols):
               r = equities.get(symbol)
 
-              if r:
-                  item = normalized(r)
-                  item["symbol"] = symbol
-                  item["name"] = str(val(r, "name", "trading_symbol"))
-                  item["category"] = "NSE_FO_STOCK"
-                  item["underlying"] = symbol
-                  stocks.append(item)
+              if not r:
+                  continue
 
-          # Keep supported cash indices, excluding index-option contracts.
+              item = normalized(r)
+              item["symbol"] = symbol
+              item["name"] = str(val(r, "name", "trading_symbol"))
+              item["category"] = "NSE_FO_STOCK"
+              item["underlying"] = symbol
+              stocks.append(item)
+
+          # 4. Save nearest stock futures separately for OI calculation.
+          stock_futures_current_month = []
+
+          for symbol in sorted(nearest_stock_future):
+              r = nearest_stock_future[symbol]
+
+              item = normalized(r)
+              item["symbol"] = symbol
+              item["name"] = str(
+                  val(r, "name", "trading_symbol", "underlying_symbol")
+              )
+              item["category"] = "NSE_STOCK_FUTURE"
+              item["underlying"] = symbol
+              stock_futures_current_month.append(item)
+
+          # 5. Cash indices only. No index option contracts.
           indices = []
 
           for r in data:
@@ -144,18 +190,16 @@ jobs:
                   item["category"] = "INDEX"
                   indices.append(item)
 
-          # Find the nearest unexpired MCX futures contract per underlying.
-          mcx_future_types = {"FUTCOM", "FUT"}
-
+          # 6. Nearest unexpired MCX futures per underlying.
           mcx = [
               r for r in data
               if upper(r, "segment") == "MCX_FO"
-              and upper(r, "instrument_type") in mcx_future_types
+              and upper(r, "instrument_type") == "FUTCOM"
               and val(r, "instrument_key")
-              and expiry_key(r) >= datetime.now(timezone.utc).date().isoformat()
+              and expiry_key(r) >= TODAY
           ]
 
-          nearest = {}
+          nearest_mcx = {}
 
           for r in mcx:
               key = upper(r, "underlying_symbol", "trading_symbol")
@@ -164,50 +208,80 @@ jobs:
                   continue
 
               if (
-                  key not in nearest
-                  or expiry_key(r) < expiry_key(nearest[key])
+                  key not in nearest_mcx
+                  or expiry_key(r) < expiry_key(nearest_mcx[key])
               ):
-                  nearest[key] = r
+                  nearest_mcx[key] = r
 
           commodities = []
 
-          for key in sorted(nearest):
-              item = normalized(nearest[key])
+          for key in sorted(nearest_mcx):
+              item = normalized(nearest_mcx[key])
               item["symbol"] = key
               item["category"] = "MCX_FUTURE"
               item["underlying"] = key
               commodities.append(item)
 
+          # 7. Final output.
           output = {
               "source": URL,
               "generated_at": datetime.now(timezone.utc).isoformat(),
               "counts": {
                   "nse_fo_stocks": len(stocks),
+                  "nse_stock_futures": len(stock_futures_current_month),
                   "indices": len(indices),
                   "mcx_futures": len(commodities),
               },
-              "instruments": stocks + indices + commodities,
+              "instruments": (
+                  stocks
+                  + indices
+                  + commodities
+              ),
+              "stock_futures_current_month": stock_futures_current_month,
           }
 
-          # Print source diagnostics to help identify filter mismatches.
+          # 8. Diagnostics.
           print("Raw records:", len(data))
-          print("Segments:", sorted({
-              upper(r, "segment") for r in data
-          }))
-          print("Instrument types:", sorted({
-              upper(r, "instrument_type") for r in data
-          }))
+          print("NSE stock futures contracts found:", len(stock_futures))
+          print(
+              "Current month stock futures:",
+              len(stock_futures_current_month)
+          )
           print("Output counts:", json.dumps(output["counts"]))
 
-          if not output["instruments"]:
+          print("Sample current month stock futures:")
+
+          for item in stock_futures_current_month[:5]:
+              print(json.dumps(item, ensure_ascii=False))
+
+          if not stocks:
+              raise RuntimeError("No NSE F&O equity instruments found")
+
+          if not stock_futures_current_month:
               raise RuntimeError(
-                  "No instruments matched. Review the source schema and filters."
+                  "No NSE stock futures found. Check Upstox master schema."
               )
 
-          with open("instruments.json", "w", encoding="utf-8") as f:
-              json.dump(output, f, ensure_ascii=False, separators=(",", ":"))
+          if not indices:
+              raise RuntimeError("No NSE cash indices found")
 
-          print("Total output records:", len(output["instruments"]))
+          if not commodities:
+              raise RuntimeError("No unexpired MCX futures found")
+
+          with open("instruments.json", "w", encoding="utf-8") as f:
+              json.dump(
+                  output,
+                  f,
+                  ensure_ascii=False,
+                  separators=(",", ":")
+              )
+
+          print("Total main instruments:", len(output["instruments"]))
+          print(
+              "Total stock futures mapping:",
+              len(output["stock_futures_current_month"])
+          )
+          print("UNIVERSE BUILD SUCCESS")
           PY
 
           python build_instruments.py
